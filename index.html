@@ -169,7 +169,7 @@ nav button.on{color:var(--main);font-weight:bold;box-shadow:inset 0 3px var(--ac
 //  برنامج مبيعات ومخزن — السكندري للتوريدات
 //  البيانات تحفظ في ذاكرة المتصفح على الجهاز (localStorage)
 // ======================================================
-const APP_VERSION='1.1';
+const APP_VERSION='1.2';
 const KEY='alskandari_pos';
 const SCAN_LIB='./html5-qrcode.min.js';
 
@@ -228,7 +228,7 @@ function load(){
     alert('⚠️ البيانات المحفوظة تالفة. تم الاحتفاظ بنسخة منها، ويمكنك استعادة آخر نسخة احتياطية من الإعدادات.');DB=normalize(clone(DEFAULTS))}
 }
 function save(){
-  try{localStorage.setItem(KEY,JSON.stringify(DB));return true}
+  try{localStorage.setItem(KEY,JSON.stringify(DB));localStorage.setItem(KEY+'_dirty','1');sbQueue();return true}
   catch(e){alert('⚠️ لم يتم الحفظ! ذاكرة المتصفح ممتلئة أو الحفظ ممنوع (التصفح الخفي).\nخذ نسخة احتياطية ثم احذف الفواتير القديمة من الإعدادات.');return false}
 }
 // تنفيذ عملية مع تراجع تلقائي إذا فشل الحفظ
@@ -700,9 +700,93 @@ function resetAll(){
 }
 
 // ---------- التشغيل ----------
+// ---------- Supabase: مزامنة سحابية (النسخة المحلية تبقى احتياطاً) ----------
+const SB_URL='https://agplitnulwisusrilsrz.supabase.co';
+const SB_KEY='sb_publishable_8kVU-81RUDfeb-Ox6FikxA_CCK5RN_3';
+const SBK=KEY+'_sb';
+let SB=null,sbSynced={},sbT=null;
+const sbParts=d=>({meta:{settings:d.settings,categories:d.categories,rateHistory:d.rateHistory,nextInvoiceNo:d.nextInvoiceNo},products:d.products,movements:d.movements,invoices:d.invoices});
+async function sbFetch(path,opt={}){
+  const h={apikey:SB_KEY,'Content-Type':'application/json',...(opt.headers||{})};
+  if(SB&&!path.startsWith('/auth/'))h.Authorization='Bearer '+SB.access_token;
+  const r=await fetch(SB_URL+path,{...opt,headers:h});
+  const t=await r.text();
+  if(!r.ok)throw new Error(r.status+' '+t.slice(0,150));
+  return t?JSON.parse(t):null;
+}
+async function sbAuth(body,type){
+  const j=await sbFetch('/auth/v1/token?grant_type='+type,{method:'POST',body:JSON.stringify(body)});
+  SB={access_token:j.access_token,refresh_token:j.refresh_token,exp:Date.now()+(j.expires_in-60)*1000};
+  localStorage.setItem(SBK,JSON.stringify(SB));
+}
+async function sbEnsure(){
+  if(!SB)return false;
+  if(Date.now()>SB.exp){
+    try{await sbAuth({refresh_token:SB.refresh_token},'refresh_token')}
+    catch(e){if(/^4\d\d/.test(e.message)){SB=null;localStorage.removeItem(SBK);sbLogin()}return false}
+  }
+  return true;
+}
+function sbQueue(){clearTimeout(sbT);sbT=setTimeout(sbPush,1500)}
+async function sbPush(){
+  if(!await sbEnsure())return;
+  const parts=sbParts(DB),rows=[];
+  for(const k in parts){const v=JSON.stringify(parts[k]);if(sbSynced[k]!==v)rows.push({key:k,value:parts[k],updated_at:nowISO(),_s:v})}
+  if(!rows.length){localStorage.removeItem(KEY+'_dirty');sbStatus('✓ متزامن');return}
+  try{
+    await sbFetch('/rest/v1/app_data?on_conflict=user_id,key',{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify(rows.map(({_s,...r})=>r))});
+    rows.forEach(r=>sbSynced[r.key]=r._s);
+    const p2=sbParts(DB);
+    if(Object.keys(p2).every(k=>sbSynced[k]===JSON.stringify(p2[k])))localStorage.removeItem(KEY+'_dirty');
+    sbStatus('✓ متزامن');
+  }catch(e){sbStatus('⚠ غير متزامن')}
+}
+async function sbPull(){
+  const rows=await sbFetch('/rest/v1/app_data?select=key,value');
+  if(!rows.length){await sbPush();return}
+  const m={};rows.forEach(r=>{m[r.key]=r.value;sbSynced[r.key]=JSON.stringify(r.value)});
+  DB=normalize({...(m.meta||{}),products:m.products||[],movements:m.movements||[],invoices:m.invoices||[]});
+  localStorage.setItem(KEY,JSON.stringify(DB));
+  sbStatus('✓ متزامن');
+}
+async function sbSync(){
+  try{
+    if(!await sbEnsure()){sbStatus('⚠ بدون مزامنة');return}
+    if(localStorage.getItem(KEY+'_dirty'))await sbPush();
+    else{await sbPull();refresh()}
+  }catch(e){sbStatus('⚠ غير متزامن')}
+}
+function sbStatus(t){
+  let b=$('sbBadge');
+  if(!b){
+    document.body.insertAdjacentHTML('beforeend','<div id="sbBadge" style="position:fixed;left:8px;bottom:72px;z-index:50;background:#334155;color:#fff;font-size:11px;padding:4px 10px;border-radius:12px;opacity:.85"></div>');
+    b=$('sbBadge');
+    b.onclick=()=>{if(SB&&confirm('تسجيل الخروج من المزامنة؟')){SB=null;sbSynced={};localStorage.removeItem(SBK);b.remove();sbLogin()}};
+  }
+  b.textContent=t;
+}
+function sbLogin(){
+  if($('sbLogin'))return;
+  const i='width:100%;box-sizing:border-box;margin-bottom:10px;padding:12px;border:1px solid #cbd5e1;border-radius:8px;font-size:16px';
+  document.body.insertAdjacentHTML('beforeend',`<div id="sbLogin" style="position:fixed;inset:0;z-index:9999;background:#f1f5f9;display:flex;align-items:center;justify-content:center;padding:20px;direction:rtl"><div style="background:#fff;border-radius:14px;padding:22px;width:100%;max-width:360px;box-shadow:0 4px 24px #0002"><h2 style="margin:0 0 14px;color:#1e3a5f">تسجيل الدخول</h2><input id="sbEm" type="email" placeholder="البريد الإلكتروني" style="${i}"><input id="sbPw" type="password" placeholder="كلمة المرور" style="${i}"><div id="sbErr" style="color:#dc2626;font-size:13px;min-height:18px;margin-bottom:6px"></div><button id="sbGo" style="width:100%;padding:12px;border:0;border-radius:8px;background:#1e3a5f;color:#fff;font-size:16px">دخول</button><button id="sbSkip" style="width:100%;padding:10px;margin-top:8px;border:0;background:none;color:#64748b;font-size:13px">المتابعة بدون مزامنة</button></div></div>`);
+  $('sbSkip').onclick=()=>$('sbLogin').remove();
+  $('sbGo').onclick=async()=>{
+    $('sbErr').textContent='';
+    try{await sbAuth({email:$('sbEm').value.trim(),password:$('sbPw').value},'password');$('sbLogin').remove();await sbSync()}
+    catch(e){$('sbErr').textContent=e instanceof TypeError?'لا يوجد اتصال بالإنترنت':'البريد أو كلمة المرور غير صحيحة'}
+  };
+}
+function sbInit(){
+  try{SB=JSON.parse(localStorage.getItem(SBK)||'null')}catch(e){SB=null}
+  if(!SB){sbLogin();return}
+  sbSync();
+}
+addEventListener('online',()=>{if(SB&&localStorage.getItem(KEY+'_dirty'))sbPush()});
+
 load();
 try{const c=JSON.parse(localStorage.getItem(KEY+'_cart')||'[]');if(Array.isArray(c))cart=c.filter(x=>x&&DB.products.some(p=>p.id===x.id))}catch(e){}
 refresh();
+sbInit();
 document.addEventListener('keydown',e=>{if(e.key!=='Escape')return;if($('mScan').classList.contains('open'))closeScanner();else closeModal()});
 // مزامنة لو البرنامج مفتوح في أكثر من تبويب
 window.addEventListener('storage',e=>{if(e.key===KEY){load();refresh()}});
