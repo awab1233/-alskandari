@@ -134,6 +134,7 @@ nav button.on{color:var(--main);font-weight:bold;box-shadow:inset 0 3px var(--ac
   <section class="page" id="pg-invoices">
     <div class="bar"><input id="iSearch" placeholder="🔎 رقم الفاتورة / اسم أو هاتف العميل" oninput="renderInvoices()"></div>
     <div id="iSum" style="margin-bottom:12px"></div>
+<div class="row" style="margin-bottom:12px"><button class="btn-light" onclick="openReport()">📊 تقرير المبيعات والأرباح</button><button class="btn-light" onclick="openDebts()">👥 ديون العملاء</button></div>
     <div id="iList"></div>
   </section>
 
@@ -169,7 +170,7 @@ nav button.on{color:var(--main);font-weight:bold;box-shadow:inset 0 3px var(--ac
 //  برنامج مبيعات ومخزن — السكندري للتوريدات
 //  البيانات تحفظ في ذاكرة المتصفح على الجهاز (localStorage)
 // ======================================================
-const APP_VERSION='1.2';
+const APP_VERSION='1.3';
 const KEY='alskandari_pos';
 const SCAN_LIB='./html5-qrcode.min.js';
 
@@ -480,7 +481,7 @@ function renderInvoices(){
   const q=$('iSearch').value.trim().toLowerCase().replace(/^#/,''),td=today(),mo=td.slice(0,7);
   const act=DB.invoices.filter(i=>i.status!=='cancelled'),sum=a=>a.reduce((t,i)=>t+i.total,0);
   const tI=act.filter(i=>dayOf(i.date)===td),mI=act.filter(i=>dayOf(i.date).startsWith(mo)),due=act.filter(i=>!i.paid);
-  $('iSum').innerHTML='<div class="grid">'+[[L(sum(tI)),`اليوم (${tI.length})`],[L(sum(mI)),`هذا الشهر (${mI.length})`],[L(sum(due)),`آجل غير مسدد (${due.length})`],[DB.invoices.length,'كل الفواتير']]
+  $('iSum').innerHTML='<div class="grid">'+[[L(sum(tI)),`اليوم (${tI.length})`],[L(sum(mI)),`هذا الشهر (${mI.length})`],[L(due.reduce((t,i)=>t+dueOf(i),0)),`آجل غير مسدد (${due.length})`],[DB.invoices.length,'كل الفواتير']]
     .map(([b,t])=>`<div class="stat"><b>${b}</b><span>${t}</span></div>`).join('')+'</div>';
   const list=DB.invoices.filter(i=>!q||String(i.no)===num(q).toString()||[i.customer,i.phone].some(x=>String(x||'').toLowerCase().includes(q))).slice(0,200);
   $('iList').innerHTML=list.map(i=>{
@@ -499,12 +500,12 @@ ${i.disc?`<div class="tot-line"><span>الخصم</span><b>- ${L(i.disc)}</b></di
 <div class="tot-line meta"><span>سعر الصرف وقت البيع</span><span>${fmt(i.rate)}</span></div>
 ${i.rate&&i.items.every(it=>it.costUsd!==undefined)?`<div class="tot-line meta"><span>الربح التقريبي</span><b>${U(i.total/i.rate-i.items.reduce((t,it)=>t+it.costUsd*it.qty,0))}</b></div>`:''}
 <div class="row" style="margin-top:8px"><button onclick="printById('${id}','A4')">🖨️ A4</button><button onclick="printById('${id}','80mm')">🧾 إيصال</button><button class="btn-ok" onclick="shareInvoice('${id}')">📲 واتساب</button></div>
-${!cx&&!i.paid?`<button class="btn-acc btn-block" onclick="markPaid('${id}')">💵 تسجيل السداد</button>`:''}
+${!cx&&!i.paid?`<div class="tot-line"><span>المدفوع: ${L(i.paidAmt||0)}</span><b style="color:var(--danger)">المتبقي: ${L(dueOf(i))}</b></div><button class="btn-acc btn-block" onclick="addPayment('${id}')">➕ تسجيل دفعة</button><button class="btn-light btn-block" onclick="markPaid('${id}')">✓ تسديد المتبقي بالكامل</button>`:''}
 ${!cx?`<button class="btn-danger btn-block" onclick="cancelInvoice('${id}')">↩️ إلغاء الفاتورة وإرجاع البضاعة للمخزن</button>`:''}
 <button class="btn-light btn-block" onclick="closeModal()">إغلاق</button>`);
 }
-function markPaid(id){const i=DB.invoices.find(x=>x.id===id);if(!i||!confirm(`تسجيل سداد الفاتورة #${i.no} بمبلغ ${L(i.total)}؟`))return;
-  if(commit(()=>{i.paid=true;i.paidAt=nowISO()})){openInvoice(id);refresh();toast('✅ تم تسجيل السداد')}}
+function markPaid(id){const i=DB.invoices.find(x=>x.id===id);if(!i||!confirm(`تسديد المتبقي ${L(dueOf(i))} من الفاتورة #${i.no}؟`))return;
+if(commit(()=>{(i.payments=i.payments||[]).push({d:nowISO(),amt:dueOf(i)});i.paidAmt=i.total;i.paid=true;i.paidAt=nowISO()})){openInvoice(id);refresh();toast('✓ تم التسديد')}}
 function cancelInvoice(id){
   const i=DB.invoices.find(x=>x.id===id);if(!i||i.status==='cancelled')return;
   if(!confirm(`إلغاء الفاتورة رقم ${i.no} وإرجاع أصنافها للمخزن؟`))return;
@@ -783,9 +784,77 @@ function sbInit(){
 }
 addEventListener('online',()=>{if(SB&&localStorage.getItem(KEY+'_dirty'))sbPush()});
 
+// ---------- دفعات جزئية + ديون العملاء + التقارير + قفل الرمز ----------
+const dueOf=i=>(i.status==='cancelled'||i.paid)?0:Math.max(0,r2(i.total-(i.paidAmt||0)));
+function addPayment(id){
+  const i=DB.invoices.find(x=>x.id===id);if(!i)return;const d=dueOf(i);if(!d)return;
+  const r=prompt('المبلغ المدفوع الآن (المتبقي '+fmt(d)+')',d);if(r===null)return;
+  const v=num(r);if(!v||v<=0)return;
+  if(v>d+0.001)return toast('المبلغ أكبر من المتبقي',1);
+  if(commit(()=>{(i.payments=i.payments||[]).push({d:nowISO(),amt:r2(v)});i.paidAmt=r2((i.paidAmt||0)+v);if(dueOf(i)<=0.009){i.paid=true;i.paidAt=nowISO()}})){openInvoice(id);refresh();toast('✓ تم تسجيل الدفعة')}
+}
+let _debts=[];
+function openDebts(){
+  const m={};
+  DB.invoices.forEach(i=>{if(i.status==='cancelled'||i.pay!=='آجل')return;const k=(i.customer||'').trim();const c=m[k]=m[k]||{name:k,phone:'',inv:[],due:0};if(i.phone)c.phone=i.phone;c.inv.push(i);c.due+=dueOf(i)});
+  _debts=Object.values(m).filter(c=>c.due>0.009).sort((x,y)=>y.due-x.due);
+  showModal(`<h3>👥 ديون العملاء</h3><p class="meta">إجمالي الديون: <b>${L(_debts.reduce((t,c)=>t+c.due,0))}</b></p>`+
+   (_debts.map((c,n)=>`<div class="item" onclick="openStatement(${n})"><div class="info"><div class="name">${esc(c.name)}</div><div class="meta">${c.inv.filter(i=>dueOf(i)>0).length} فاتورة غير مسددة</div></div><b style="color:var(--danger)">${L(c.due)}</b></div>`).join('')||'<p class="meta">لا توجد ديون 🎉</p>')+
+   `<button class="btn-light btn-block" onclick="closeModal()">إغلاق</button>`);
+}
+function openStatement(n){
+  const c=_debts[n];if(!c)return;
+  const rows=c.inv.slice().reverse().map(i=>`<tr><td>#${i.no}</td><td>${dayOf(i.date)}</td><td>${fmt(i.total)}</td><td>${fmt(i.paid?i.total:(i.paidAmt||0))}</td><td><b>${fmt(dueOf(i))}</b></td></tr>`).join('');
+  const tbl=`<table style="width:100%;border-collapse:collapse;text-align:center" border="1"><tr><th>فاتورة</th><th>التاريخ</th><th>الإجمالي</th><th>المدفوع</th><th>المتبقي</th></tr>${rows}<tr><th colspan="4">إجمالي المتبقي</th><th>${fmt(c.due)} ${DB.settings.currencySymbol}</th></tr></table>`;
+  window._stmt=shopHead('كشف حساب — '+esc(c.name))+tbl;
+  showModal(`<h3>كشف حساب: ${esc(c.name)}</h3>${c.phone?'<p class="meta">'+esc(c.phone)+'</p>':''}<div style="overflow-x:auto">${tbl}</div><button class="btn-acc btn-block" onclick="doPrint(window._stmt,false)">🖨 طباعة الكشف</button><button class="btn-light btn-block" onclick="openDebts()">رجوع</button>`);
+}
+function openReport(){
+  const td=today();
+  showModal(`<h3>📊 تقرير المبيعات والأرباح</h3><div class="row"><div><label>من</label><input type="date" id="rF" value="${td.slice(0,8)}01" onchange="renderReport()"></div><div><label>إلى</label><input type="date" id="rT" value="${td}" onchange="renderReport()"></div></div><div id="rep"></div><button class="btn-light btn-block" onclick="closeModal()">إغلاق</button>`);
+  renderReport();
+}
+function renderReport(){
+  const f=$('rF').value,e=$('rT').value;
+  const a=DB.invoices.filter(i=>i.status!=='cancelled'&&dayOf(i.date)>=f&&dayOf(i.date)<=e);
+  let sales=0,rev=0,cost=0,noCost=0;const pm={};
+  a.forEach(i=>{sales+=i.total;
+    if(i.rate&&i.items.every(it=>it.costUsd!==undefined)){rev+=i.total/i.rate;i.items.forEach(it=>cost+=it.costUsd*it.qty)}else noCost++;
+    i.items.forEach(it=>{const p=pm[it.name]=pm[it.name]||{q:0,t:0};p.q+=it.qty;p.t+=it.total})});
+  const top=Object.entries(pm).sort((x,y)=>y[1].t-x[1].t).slice(0,7);
+  $('rep').innerHTML=`<div class="grid"><div class="stat"><b>${L(sales)}</b><span>المبيعات (${a.length} فاتورة)</span></div><div class="stat"><b>${U(rev-cost)}</b><span>الربح التقريبي</span></div><div class="stat"><b>${L(a.reduce((t,i)=>t+dueOf(i),0))}</b><span>ديون غير محصّلة</span></div><div class="stat"><b>${rev?fmt((rev-cost)/rev*100,1)+'%':'—'}</b><span>هامش الربح</span></div></div>`
+   +(noCost?`<p class="meta">${noCost} فاتورة قديمة بلا تكلفة لم تدخل في الربح</p>`:'')+`<h4>الأكثر مبيعاً</h4>`
+   +(top.map(([n,p])=>`<div class="tot-line"><span>${esc(n)} <span class="meta">(${fmt(p.q,3)})</span></span><b>${fmt(p.t)}</b></div>`).join('')||'<p class="meta">لا مبيعات في هذه الفترة</p>');
+}
+// قفل بالرمز (على هذا الجهاز فقط، لا يُزامَن)
+const PINK=KEY+'_pin';
+const sha=async t=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode('sk:'+t)))].map(x=>x.toString(16).padStart(2,'0')).join('');
+const dg=s=>String(s).replace(/[٠-٩]/g,d=>'٠١٢٣٤٥٦٧٨٩'.indexOf(d));
+let pinHidden=0;
+function pinLock(){
+  if(!localStorage.getItem(PINK)||$('pinLock'))return;
+  document.body.insertAdjacentHTML('beforeend',`<div id="pinLock" style="position:fixed;inset:0;z-index:99999;background:#1e3a5f;display:flex;align-items:center;justify-content:center;direction:rtl"><div style="text-align:center;color:#fff;width:260px"><h2>🔒 التطبيق مقفل</h2><input id="pinIn" type="password" inputmode="numeric" autocomplete="off" placeholder="أدخل الرمز" style="width:100%;box-sizing:border-box;padding:14px;font-size:22px;text-align:center;border-radius:10px;border:0"><div id="pinErr" style="min-height:22px;color:#fca5a5;margin:8px 0"></div><button id="pinGo" style="width:100%;padding:12px;border:0;border-radius:8px;background:#f59e0b;color:#1e3a5f;font-size:16px">فتح</button></div></div>`);
+  const inp=$('pinIn'),chk=async(auto)=>{const v=dg(inp.value);if(v.length<4)return;if(await sha(v)===localStorage.getItem(PINK))$('pinLock').remove();else if(!auto||v.length>=8){$('pinErr').textContent='رمز خاطئ';inp.value=''}};
+  inp.oninput=()=>chk(true);$('pinGo').onclick=()=>chk(false);inp.focus();
+}
+async function setPin(){
+  const cur=localStorage.getItem(PINK);
+  if(cur){const o=prompt('أدخل الرمز الحالي');if(o===null)return;if(await sha(dg(o))!==cur)return toast('الرمز غير صحيح',1)}
+  const n=prompt(cur?'الرمز الجديد (4 إلى 8 أرقام) — اتركه فارغاً لإزالة القفل':'اختر رمزاً من 4 إلى 8 أرقام');
+  if(n===null)return;
+  if(!n&&cur){localStorage.removeItem(PINK);renderSettings();return toast('تم إزالة القفل')}
+  const v=dg(n);if(!/^\d{4,8}$/.test(v))return toast('الرمز يجب أن يكون 4 إلى 8 أرقام',1);
+  const c2=prompt('أعد كتابة الرمز');if(c2===null||dg(c2)!==v)return toast('الرمزان غير متطابقين',1);
+  localStorage.setItem(PINK,await sha(v));renderSettings();toast('✓ تم تفعيل القفل');
+}
+document.addEventListener('visibilitychange',()=>{if(document.hidden)pinHidden=Date.now();else if(pinHidden&&Date.now()-pinHidden>60000)pinLock()});
+const _rs=renderSettings;
+renderSettings=function(){_rs();const on=!!localStorage.getItem(PINK);$('pg-settings').insertAdjacentHTML('afterbegin',`<div class="card"><h3>🔒 قفل التطبيق</h3><p class="meta">${on?'القفل مفعّل على هذا الجهاز':'يُطلب الرمز عند فتح التطبيق، ويحمي التكلفة والأرباح'}</p><button class="btn-light btn-block" onclick="setPin()">${on?'تغيير / إزالة الرمز':'تفعيل قفل الرمز'}</button></div>`)};
+
 load();
 try{const c=JSON.parse(localStorage.getItem(KEY+'_cart')||'[]');if(Array.isArray(c))cart=c.filter(x=>x&&DB.products.some(p=>p.id===x.id))}catch(e){}
 refresh();
+pinLock();
 sbInit();
 document.addEventListener('keydown',e=>{if(e.key!=='Escape')return;if($('mScan').classList.contains('open'))closeScanner();else closeModal()});
 // مزامنة لو البرنامج مفتوح في أكثر من تبويب
